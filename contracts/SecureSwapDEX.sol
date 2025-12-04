@@ -1,96 +1,145 @@
---------------------------------------------------
---------------------------------------------------
-contract ReentrancyGuard {
-    uint256 private unlocked = 1;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
 
-    modifier nonReentrant() {
-        require(unlocked == 1, "Reentrancy");
-        unlocked = 0;
-        _;
-        unlocked = 1;
-    }
-}
+/**
+ * @title SecureSwap DEX
+ * @notice Decentralized Token Swap with Liquidity Pools (AMM)
+ */
 
-LP TOKEN (MINIMAL ERC20)
---------------------------------------------------
---------------------------------------------------
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
 contract SecureSwapDEX is ReentrancyGuard {
-    struct Pool {
-        address tokenA;
-        address tokenB;
-        LPToken lp;
-        uint112 reserveA;
-        uint112 reserveB;
-        bool exists;
+    IERC20 public tokenA;
+    IERC20 public tokenB;
+
+    uint256 public reserveA;
+    uint256 public reserveB;
+
+    mapping(address => uint256) public lpBalances;
+    uint256 public totalLP;
+
+    event LiquidityAdded(address indexed provider, uint256 amountA, uint256 amountB, uint256 lpMinted);
+    event LiquidityRemoved(address indexed provider, uint256 amountA, uint256 amountB, uint256 lpBurned);
+    event Swapped(address indexed user, uint256 amountIn, uint256 amountOut, string pair);
+
+    constructor(address _tokenA, address _tokenB) {
+        tokenA = IERC20(_tokenA);
+        tokenB = IERC20(_tokenB);
     }
 
-    uint256 public poolCount;
-    mapping(uint256 => Pool) public pools;
+    // ---------- Add Liquidity ----------
+    function addLiquidity(uint256 amountA, uint256 amountB) external nonReentrant {
+        require(amountA > 0 && amountB > 0, "Amounts must be > 0");
 
-    event PoolCreated(uint256 indexed id, address tokenA, address tokenB);
-    event LiquidityAdded(uint256 indexed id, address indexed provider, uint256 amountA, uint256 amountB, uint256 lpMinted);
-    event LiquidityRemoved(uint256 indexed id, address indexed provider, uint256 amountA, uint256 amountB, uint256 lpBurned);
-    event SwapExecuted(uint256 indexed id, address indexed user, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOut);
+        tokenA.transferFrom(msg.sender, address(this), amountA);
+        tokenB.transferFrom(msg.sender, address(this), amountB);
 
-    CREATE POOL
-    --------------------------------------------------
-    --------------------------------------------------
-    function _updateReserves(uint256 id, uint256 newA, uint256 newB) internal {
-        pools[id].reserveA = uint112(newA);
-        pools[id].reserveB = uint112(newB);
+        uint256 lpMint;
+        if (totalLP == 0) {
+            lpMint = sqrt(amountA * amountB);
+        } else {
+            lpMint = min(
+                (amountA * totalLP) / reserveA,
+                (amountB * totalLP) / reserveB
+            );
+        }
+
+        require(lpMint > 0, "LP amount too low");
+        lpBalances[msg.sender] += lpMint;
+        totalLP += lpMint;
+
+        reserveA += amountA;
+        reserveB += amountB;
+
+        emit LiquidityAdded(msg.sender, amountA, amountB, lpMint);
     }
 
-    ADD LIQUIDITY
-    --------------------------------------------------
-    --------------------------------------------------
-    function removeLiquidity(uint256 id, uint256 lpAmount) external nonReentrant {
-        Pool storage p = pools[id];
-        require(p.exists, "Pool not found");
+    // ---------- Remove Liquidity ----------
+    function removeLiquidity(uint256 lpAmount) external nonReentrant {
+        require(lpBalances[msg.sender] >= lpAmount, "Insufficient LP");
 
-        uint256 supply = p.lp.totalSupply();
+        uint256 share = (lpAmount * 1e18) / totalLP;
 
-        uint256 amountA = (lpAmount * p.reserveA) / supply;
-        uint256 amountB = (lpAmount * p.reserveB) / supply;
+        uint256 amountA = (reserveA * share) / 1e18;
+        uint256 amountB = (reserveB * share) / 1e18;
 
-        p.lp.burn(msg.sender, lpAmount);
+        lpBalances[msg.sender] -= lpAmount;
+        totalLP -= lpAmount;
 
-        IERC20(p.tokenA).transfer(msg.sender, amountA);
-        IERC20(p.tokenB).transfer(msg.sender, amountB);
+        reserveA -= amountA;
+        reserveB -= amountB;
 
-        _updateReserves(
-            id,
-            p.reserveA - amountA,
-            p.reserveB - amountB
-        );
+        tokenA.transfer(msg.sender, amountA);
+        tokenB.transfer(msg.sender, amountB);
 
-        emit LiquidityRemoved(id, msg.sender, amountA, amountB, lpAmount);
+        emit LiquidityRemoved(msg.sender, amountA, amountB, lpAmount);
     }
 
-    SWAP FUNCTION
-    x * y = k invariant swap with 0.30% fee
-        uint256 amountInWithFee = (amountIn * 997) / 1000;
-        amountOut = (amountInWithFee * reserveOut) / (reserveIn + amountInWithFee);
+    // ---------- Swap A → B ----------
+    function swapAforB(uint256 amountAIn) external nonReentrant {
+        require(amountAIn > 0, "Amount must be > 0");
 
-        require(amountOut > 0, "Invalid output amount");
+        tokenA.transferFrom(msg.sender, address(this), amountAIn);
+        uint256 amountBOut = getAmountOut(amountAIn, reserveA, reserveB);
 
-        IERC20(tokenOut).transfer(msg.sender, amountOut);
+        reserveA += amountAIn;
+        reserveB -= amountBOut;
 
-        --------------------------------------------------
-    --------------------------------------------------
+        tokenB.transfer(msg.sender, amountBOut);
+        emit Swapped(msg.sender, amountAIn, amountBOut, "A->B");
+    }
+
+    // ---------- Swap B → A ----------
+    function swapBforA(uint256 amountBIn) external nonReentrant {
+        require(amountBIn > 0, "Amount must be > 0");
+
+        tokenB.transferFrom(msg.sender, address(this), amountBIn);
+        uint256 amountAOut = getAmountOut(amountBIn, reserveB, reserveA);
+
+        reserveB += amountBIn;
+        reserveA -= amountAOut;
+
+        tokenA.transfer(msg.sender, amountAOut);
+        emit Swapped(msg.sender, amountBIn, amountAOut, "B->A");
+    }
+
+    // ---------- AMM Pricing (x*y=k) ----------
+    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        uint256 amountInWithFee = amountIn * 997; // 0.3% fee
+        uint256 numerator = amountInWithFee * reserveOut;
+        uint256 denominator = (reserveIn * 1000) + amountInWithFee;
+        return numerator / denominator;
+    }
+
+    // ---------- Helpers ----------
+    function sqrt(uint256 x) internal pure returns (uint256 y) {
+        if (x > 3) {
+            y = x;
+            uint256 z = (x / 2) + 1;
+            while (z < y) {
+                y = z;
+                z = ((x / z) + z) / 2;
+            }
+        } else if (x != 0) {
+            y = 1;
+        }
+    }
+
     function min(uint256 a, uint256 b) internal pure returns (uint256) {
         return a <= b ? a : b;
     }
 
-    function sqrt(uint256 x) internal pure returns (uint256 y) {
-        if (x == 0) return 0;
-        uint256 z = (x + 1) / 2;
-        y = x;
-        while (z < y) {
-            y = z;
-            z = (x / z + z) / 2;
-        }
+    // ---------- User View ----------
+    function getUserLP(address user) external view returns (uint256) {
+        return lpBalances[user];
+    }
+
+    function getPriceAtoB(uint256 amountAIn) external view returns (uint256) {
+        return getAmountOut(amountAIn, reserveA, reserveB);
+    }
+
+    function getPriceBtoA(uint256 amountBIn) external view returns (uint256) {
+        return getAmountOut(amountBIn, reserveB, reserveA);
     }
 }
-// 
-Contract End
-// 
